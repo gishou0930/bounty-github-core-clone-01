@@ -108,7 +108,17 @@ export function ancestors(repo, sha) {
   }
   return seen;
 }
-export function ancestor(repo, old, next) { return ancestors(repo, next).has(old); }
+export function ancestor(repo, old, next) {
+  const seen = new Set(), queue = [next];
+  while (queue.length) {
+    const sha = queue.pop();
+    if (sha === old) return true;
+    if (!sha || seen.has(sha)) continue;
+    seen.add(sha);
+    queue.push(...(commitInfo(repo, sha)?.parents || []));
+  }
+  return false;
+}
 export function repoView(repo) {
   return { id: repo.id, node_id: repo.node_id, name: repo.name, full_name: `${viewer().login}/${repo.name}`, owner: viewer(), private: repo.private, description: repo.description, default_branch: repo.default_branch, has_issues: true, archived: false, fork: false, created_at: stamp, updated_at: stamp, clone_url: `/${viewer().login}/${repo.name}.git`, html_url: `/${viewer().login}/${repo.name}` };
 }

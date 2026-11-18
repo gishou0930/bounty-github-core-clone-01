@@ -58,30 +58,31 @@ function advertisement(repo, service, v2) {
   }
   return Buffer.concat([...out, flush]);
 }
-function reachable(repo, roots, depth = Infinity, stop = new Set()) {
+function reachable(repo, roots, depth = Infinity, stop = new Set(), relative = null) {
   const objects = new Set(), shallow = new Set(), commitDepth = new Map();
-  const queue = roots.map(sha => [sha, 1]);
+  const queue = roots.map(sha => [sha, 1, Infinity]);
   for (let i = 0; i < queue.length; ++i) {
-    const [sha, level] = queue[i];
+    const [sha, level, budget] = queue[i];
     const obj = repo.objects.get(sha);
     if (!obj) continue;
-    if (objects.has(sha) && (obj.type !== 'commit' || commitDepth.get(sha) <= level)) continue;
+    const room = relative ? (budget === Infinity && relative.boundaries.has(sha) ? relative.amount : budget) : depth - level;
+    if (objects.has(sha) && (obj.type !== 'commit' || commitDepth.get(sha) >= room)) continue;
     objects.add(sha);
     if (obj.type === 'commit') {
-      commitDepth.set(sha, level);
+      commitDepth.set(sha, room);
       const commit = commitInfo(repo, sha);
       queue.push([commit.tree, level]);
-      if (level >= depth || stop.has(sha)) {
+      if (room <= 0 || stop.has(sha)) {
         if (commit.parents.length) shallow.add(sha);
       } else {
         shallow.delete(sha);
-        queue.push(...commit.parents.map(p => [p, level + 1]));
+        queue.push(...commit.parents.map(p => [p, level + 1, room - 1]));
       }
     } else if (obj.type === 'tree') {
       for (const entry of treeEntries(repo, sha)) if (entry.mode !== '160000') queue.push([entry.sha, level]);
     } else if (obj.type === 'tag') {
       const target = /^object ([0-9a-f]{40})/m.exec(obj.data.toString())?.[1];
-      if (target) queue.push([target, level]);
+      if (target) queue.push([target, level, budget]);
     }
   }
   return { objects, shallow };
@@ -230,15 +231,24 @@ function upload(repo, data, v2) {
   const shallows = lines.filter(x => x.startsWith('shallow ')).map(x => x.split(' ')[1]);
   const deepen = lines.find(x => x.startsWith('deepen '));
   const depth = deepen ? Math.max(1, Number(deepen.slice(7))) : Infinity;
+  const relative = deepen && lines.includes('deepen-relative') ? { boundaries: new Set(shallows), amount: depth } : null;
+  const done = lines.includes('done');
   for (const sha of wants) if (!repo.objects.has(sha)) error(400, 'Unknown wanted object');
-  const cacheKey = JSON.stringify([wants, haves, shallows, depth, v2]);
+  const cacheKey = JSON.stringify([wants, haves, shallows, depth, !!relative, done, v2]);
   repo.fetchCache ||= new Map();
   if (repo.fetchCache.has(cacheKey)) return repo.fetchCache.get(cacheKey);
-  const needed = reachable(repo, wants, depth);
+  const needed = reachable(repo, wants, depth, new Set(), relative);
   const known = reachable(repo, haves, Infinity, new Set(shallows)).objects;
   const ids = [...needed.objects].filter(sha => !known.has(sha));
   const pieces = [];
   if (v2) {
+    if (!done) {
+      const common = haves.filter(sha => repo.objects.has(sha));
+      pieces.push(packet('acknowledgments\n'));
+      if (!common.length) return Buffer.concat([...pieces, packet('NAK\n'), flush]);
+      for (const sha of common) pieces.push(packet(`ACK ${sha}\n`));
+      pieces.push(packet('ready\n'), delim);
+    }
     if (needed.shallow.size || shallows.length) {
       pieces.push(packet('shallow-info\n'));
       for (const sha of needed.shallow) pieces.push(packet(`shallow ${sha}\n`));
